@@ -4,19 +4,13 @@
 
 ## 项目背景
 
-在Linux服务器，我使用[cc-switch-cli](https://github.com/SaladDay/cc-switch-cli)更好自己切换服务。
+我在 Linux 服务器上使用 [cc-switch-cli](https://github.com/SaladDay/cc-switch-cli) 切换 Codex 上游服务。直接把 Codex 改到不同中转站时，当前会话和历史状态容易变得不稳定。这个仓库提供一个小的同步层：让 Codex 固定连接本地 `cc-switch` 代理，真实 provider 在代理后面切换。
 
-但是Codex直接换中转站会导致历史记录不见，虽然可以让agent帮忙恢复，但是还是很麻烦，就vibe coding了一个小的中间层。如果你现在能用code agent，直接把仓库链接丢给ta就能帮完成好了。
+如果你已经能使用 code agent，可以直接把这个仓库链接交给 agent，让它按 README 在服务器上部署。
 
-让 Codex 始终连接到稳定的本地 `cc-switch` 代理 provider，而真实上游 provider 在代理后面切换。
+## 核心思路
 
-这个方案适合这样的场景：你用 `cc-switch` 切换多个 Codex 兼容 provider，但不希望 Codex 自己的 `model_provider`、`base_url`、`auth` 每次都被改成真实 provider，从而影响当前会话连续性。
-
-## 功能
-
-同步脚本会读取 `cc-switch` SQLite 数据库里的当前 Codex provider，并写入 Codex 配置文件。
-
-当 `cc-switch` 里 Codex 代理已开启时，Codex 会被配置为：
+Codex 始终看到同一个 provider：
 
 ```toml
 model_provider = "cc_switch_proxy"
@@ -29,7 +23,7 @@ wire_api = "responses"
 requires_openai_auth = true
 ```
 
-Codex 的认证文件会写成占位 key：
+Codex 的 `auth.json` 在代理模式下只保留占位 key：
 
 ```json
 {
@@ -37,37 +31,22 @@ Codex 的认证文件会写成占位 key：
 }
 ```
 
-真实 provider 的 `base_url` 和 API key 仍然保存在 `cc-switch` 中。Codex 只访问本地代理。
-
-## 为什么有用
-
-Codex 的会话和本地状态通常保存在：
-
-```text
-$HOME/.codex/
-```
-
-关键点是 provider 身份稳定。如果 Codex 被反复改成 provider A、provider B、provider C，运行中的 Codex 可能会把 provider、认证、base URL 的变化视为后端变更，从而影响当前工作流或会话连续性。
-
-使用本方案后，Codex 看到的始终是：
-
-- `model_provider = "cc_switch_proxy"`
-- `base_url = "http://<本地代理地址>:<本地代理端口>/v1"`
-- 占位 OpenAI API key
-
-真实上游 provider 只在 `cc-switch` 内部切换。
+真实上游的 `base_url` 和 API key 留在 `cc-switch` 数据库里。本地代理负责把 Codex 请求转发到当前选中的真实 provider。
 
 ## 文件说明
 
-- `cc-switch-sync-codex.py`：从 `cc-switch` 同步 Codex 配置和认证。
-- `quick-check.sh`：打印代理状态和 Codex 配置状态。
+- `cc-switch-sync-codex.py`：把 `cc-switch` 当前 Codex provider 同步到 Codex 配置。
+- `cc-switch-check-codex.py`：用 Python 标准库检查代理、provider、Codex 配置和 auth 状态。
+- `quick-check.sh`：检查脚本的 shell 包装，兼容 `CC_SWITCH_DB` / `CODEX_DIR` 环境变量。
+- `cc-switch-hot.sh`：先执行 `cc-switch`，成功后自动运行同步脚本。
+- `systemd/cc-switch-codex-proxy.service`：用户级 systemd 服务模板，用于常驻运行 Codex 代理。
 
 ## 环境要求
 
 - Python 3.10 或更高版本。
-- `quick-check.sh` 需要 `sqlite3` 命令行工具。
+- 已安装 `cc-switch-cli`。
 - 已存在可用的 `cc-switch` 数据库，并且其中包含 Codex provider。
-- `cc-switch` 已为 `app_type = 'codex'` 配置或启动代理。
+- `cc-switch` 已为 `app_type = 'codex'` 启动代理 takeover。
 - Codex 使用文件方式读取其配置目录。
 
 默认路径：
@@ -78,11 +57,90 @@ $HOME/.codex/config.toml
 $HOME/.codex/auth.json
 ```
 
-注意：如果 Codex 进程运行在另一个用户下，必须使用那个用户的 `$HOME`。例如 Codex 以 `root` 运行，而同步脚本以普通用户运行，两者默认会写到不同的配置目录。此时应显式传路径。
+如果 Codex 进程运行在另一个用户下，必须使用那个用户的 `$HOME`。例如 Codex 以 `root` 运行，而同步脚本以普通用户运行，两者默认会写到不同配置目录。此时应显式传路径。
 
-## 使用方法
+## 从零接入
 
-先 dry run，确认将要生成的内容：
+### 1. 安装 cc-switch-cli
+
+本仓库不安装 `cc-switch`，也不初始化 provider。先按 `cc-switch-cli` 官方方式安装，例如：
+
+```bash
+curl -fsSL https://github.com/SaladDay/cc-switch-cli/releases/latest/download/install.sh | bash
+```
+
+确认命令可用：
+
+```bash
+cc-switch --help
+```
+
+### 2. 创建 Codex provider
+
+同步脚本依赖 `cc-switch` 数据库中已经有当前 Codex provider。先创建并选中至少一个 `app_type = 'codex'` 的 provider。
+
+常用检查命令：
+
+```bash
+cc-switch --app codex provider list
+cc-switch --app codex provider current
+```
+
+建议把 provider 配置职责拆清楚：
+
+- `providers.settings_config.config`：只放真实上游相关配置，例如真实 `model_provider`、`model`、`base_url`、`wire_api`。
+- `providers.settings_config.auth`：保存真实上游认证。
+- `settings.common_config_codex`：保存跨 provider 通用的 Codex 顶层配置。
+
+通用配置示例：
+
+```toml
+model_reasoning_effort = "high"
+disable_response_storage = true
+```
+
+不要同时在 provider 配置和 `common_config_codex` 中重复放同一个顶层字段，否则容易产生冲突。
+
+### 3. 启动 Codex 代理 takeover
+
+注意：`proxy enable` 和“代理正在运行”不是一回事。
+
+同步脚本只有在以下两个数据库字段都为 `1` 时，才会把 Codex 指到本地代理：
+
+```text
+proxy_enabled = 1
+enabled = 1
+```
+
+通常需要真正启动代理进程：
+
+```bash
+cc-switch proxy serve --takeover codex
+```
+
+前台验证成功后，建议用用户级 systemd 常驻。
+
+### 4. 安装脚本到用户目录
+
+一种推荐布局：
+
+```bash
+mkdir -p "$HOME/.local/share/cc-switch-codex-hot-switch" "$HOME/.local/bin"
+cp cc-switch-sync-codex.py cc-switch-check-codex.py quick-check.sh cc-switch-hot.sh \
+  "$HOME/.local/share/cc-switch-codex-hot-switch/"
+chmod +x "$HOME/.local/share/cc-switch-codex-hot-switch/"*.py
+chmod +x "$HOME/.local/share/cc-switch-codex-hot-switch/"*.sh
+ln -sf "$HOME/.local/share/cc-switch-codex-hot-switch/cc-switch-sync-codex.py" \
+  "$HOME/.local/bin/cc-switch-codex-sync"
+ln -sf "$HOME/.local/share/cc-switch-codex-hot-switch/cc-switch-check-codex.py" \
+  "$HOME/.local/bin/cc-switch-codex-check"
+ln -sf "$HOME/.local/share/cc-switch-codex-hot-switch/cc-switch-hot.sh" \
+  "$HOME/.local/bin/cc-switch-hot"
+```
+
+### 5. 同步 Codex 配置
+
+先 dry run：
 
 ```bash
 python3 cc-switch-sync-codex.py --dry-run
@@ -94,7 +152,30 @@ python3 cc-switch-sync-codex.py --dry-run
 python3 cc-switch-sync-codex.py
 ```
 
-检查结果：
+如果 Codex 使用的 home 不是当前 shell 的 `$HOME`：
+
+```bash
+python3 cc-switch-sync-codex.py \
+  --home /path/to/codex-user-home
+```
+
+也可以直接传数据库和 Codex 配置目录：
+
+```bash
+python3 cc-switch-sync-codex.py \
+  --db-path /path/to/.cc-switch/cc-switch.db \
+  --codex-dir /path/to/.codex
+```
+
+### 6. 检查验收
+
+运行：
+
+```bash
+python3 cc-switch-check-codex.py
+```
+
+或：
 
 ```bash
 ./quick-check.sh
@@ -108,19 +189,86 @@ CODEX_DIR=/path/to/.codex \
 ./quick-check.sh
 ```
 
-如果 Codex 实际使用的 home 不是当前 shell 的 `$HOME`：
+验收标准：
 
-```bash
-python3 cc-switch-sync-codex.py \
-  --home /path/to/codex-user-home
+- `proxy_config.proxy_enabled = 1`
+- `proxy_config.enabled = 1`
+- `proxy_runtime_session` 能看到运行时地址和端口
+- `~/.codex/config.toml` 指向 `model_provider = "cc_switch_proxy"`
+- `~/.codex/config.toml` 包含 `[model_providers.cc_switch_proxy]`
+- `~/.codex/auth.json` 是 `proxy-placeholder`
+- `cc-switch` 当前 Codex provider 仍保存真实上游认证
+
+## systemd 常驻代理
+
+仓库提供模板：
+
+```text
+systemd/cc-switch-codex-proxy.service
 ```
 
-也可以直接传数据库和 Codex 配置目录：
+安装到用户级 systemd：
 
 ```bash
-python3 cc-switch-sync-codex.py \
-  --db-path /path/to/.cc-switch/cc-switch.db \
-  --codex-dir /path/to/.codex
+mkdir -p "$HOME/.config/systemd/user"
+cp systemd/cc-switch-codex-proxy.service "$HOME/.config/systemd/user/"
+systemctl --user daemon-reload
+systemctl --user enable --now cc-switch-codex-proxy.service
+```
+
+查看状态：
+
+```bash
+systemctl --user status cc-switch-codex-proxy.service
+```
+
+模板默认执行：
+
+```text
+%h/.local/bin/cc-switch proxy serve --takeover codex
+```
+
+如果你的 `cc-switch` 不在 `$HOME/.local/bin/cc-switch`，需要修改 service 里的 `ExecStart`。
+
+## 切换后自动同步
+
+仓库提供 `cc-switch-hot.sh`。它会先执行原始 `cc-switch` 命令，命令成功后再调用 `cc-switch-sync-codex.py`。
+
+示例：
+
+```bash
+cc-switch-hot --app codex provider switch <provider-id>
+```
+
+如果已经按推荐布局安装，可以在交互式 shell 中加 alias：
+
+```bash
+alias cc-switch='cc-switch-hot'
+```
+
+或写入 `~/.bash_aliases`：
+
+```bash
+echo "alias cc-switch='cc-switch-hot'" >> "$HOME/.bash_aliases"
+```
+
+跳过自动同步：
+
+```bash
+CODEX_HOT_SWITCH_SKIP_SYNC=1 cc-switch-hot --help
+```
+
+如果 `cc-switch` 命令路径特殊：
+
+```bash
+CC_SWITCH_BIN=/custom/path/cc-switch cc-switch-hot --app codex provider current
+```
+
+如果同步脚本路径特殊：
+
+```bash
+CODEX_SYNC_SCRIPT=/custom/path/cc-switch-sync-codex.py \
+  cc-switch-hot --app codex provider switch <provider-id>
 ```
 
 ## 使用到的 cc-switch 数据库字段
@@ -144,26 +292,12 @@ WHERE app_type = 'codex'
 LIMIT 1;
 ```
 
-代理模式只有在以下两个值都开启时才生效：
-
-```text
-proxy_enabled = 1
-enabled = 1
-```
-
 如果 `settings.proxy_runtime_session` 存在，并且包含 `address` 或 `port`，脚本会优先使用运行时地址和端口，而不是 `proxy_config.listen_address` / `proxy_config.listen_port`。
 
 脚本还会追加共享 Codex 配置：
 
 ```sql
 SELECT value FROM settings WHERE key = 'common_config_codex';
-```
-
-例如：
-
-```toml
-model_reasoning_effort = "high"
-disable_response_storage = true
 ```
 
 ## 配置保留规则
@@ -178,12 +312,14 @@ disable_response_storage = true
 
 也会移除已有的 `[model_providers.*]` 段，避免旧 provider 残留。
 
-其他 Codex 配置段会保留。例如项目 trust 配置：
+其他 Codex 配置段会保留。例如：
 
 ```toml
 [projects."/path/to/project"]
 trust_level = "trusted"
 ```
+
+MCP 配置和其他非 provider section 也会保留。
 
 ## 安全说明
 
@@ -199,7 +335,7 @@ trust_level = "trusted"
 
 真实 API key 保存在本地 `cc-switch` 数据库中。这个数据库应视为敏感文件，不要发布。
 
-`--dry-run` 和 `quick-check.sh` 会在输出认证信息时自动打码。注意：如果代理模式未开启，同步脚本仍会把真实认证信息写入 Codex 的 `auth.json`，因为这种模式下 Codex 是直接访问当前 provider。
+`--dry-run` 和检查脚本会在输出认证信息时自动打码。注意：如果代理模式未开启，同步脚本仍会把真实认证信息写入 Codex 的 `auth.json`，因为这种模式下 Codex 是直接访问当前 provider。
 
 推送到 GitHub 前建议检查：
 
@@ -219,6 +355,20 @@ $HOME/.cc-switch/cc-switch.db
 ```
 
 解决方式：用拥有该数据库的同一个用户运行脚本，或传入 `--home` / `--db-path`。
+
+### 没有当前 Codex provider
+
+先在 `cc-switch` 中创建并选中一个 `app_type = 'codex'` 的 provider。同步脚本不负责创建 provider。
+
+### 执行了 proxy enable 但 Codex 没切到代理
+
+`proxy enable` 只表示持久开关打开，不等于代理进程正在接管。需要运行：
+
+```bash
+cc-switch proxy serve --takeover codex
+```
+
+并确认检查脚本里 `proxy_enabled` 和 `enabled` 都通过。
 
 ### Codex 仍然使用旧 provider
 
@@ -245,17 +395,6 @@ model_provider = "cc_switch_proxy"
 - Codex 没有实际指向本地代理；
 - 脚本写入的 `$HOME` 与 Codex 进程实际使用的 `$HOME` 不一致。
 
-### 代理端口不对
-
-检查运行时代理会话：
-
-```bash
-sqlite3 "$HOME/.cc-switch/cc-switch.db" \
-  "SELECT value FROM settings WHERE key='proxy_runtime_session';"
-```
-
-如果其中包含 `address` 或 `port`，同步脚本会优先使用这些值。
-
 ### 会话历史看起来丢失
 
 先确认 Codex 使用的是预期 home：
@@ -267,14 +406,11 @@ ls -la "$HOME/.codex"
 
 会话连续性依赖同一个 Codex 数据目录。切换用户、容器或挂载目录后，即使文件没有被删除，也可能看起来像历史丢失。
 
-## 推荐运行模型
-
-在 `cc-switch` provider 状态变化后运行此脚本，尤其是代理地址、端口或模型选择可能变化时。
-
-理想稳定状态：
+## 推荐稳定态
 
 1. Codex 配置指向 `cc_switch_proxy`。
 2. Codex auth 使用占位 key。
-3. 本地 `cc-switch` 代理把请求转发到当前选择的真实上游 provider。
-4. provider 切换发生在 `cc-switch` 内部，而不是把 Codex 直接改写到每个真实 provider。
+3. `cc-switch` provider 保存真实上游配置和认证。
+4. 本地 `cc-switch` 代理由 systemd 或其他守护方式常驻。
+5. provider 切换后自动调用同步脚本。
 
